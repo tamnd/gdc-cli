@@ -1,0 +1,10 @@
+title       = "gdc"
+baseURL     = "https://gdc-cli.tamnd.com/"
+description = "A command line for gdc."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/gdc-cli"
