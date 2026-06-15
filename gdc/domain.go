@@ -2,7 +2,7 @@ package gdc
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,59 +19,59 @@ import (
 // gdc:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone gdc binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the gdc driver. It carries no state; the per-run client is
+// Domain is the GDC driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "gdc",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "gdc",
-			Short:  "A command line for gdc.",
-			Long: `A command line for gdc.
+			Short:  "A command line for the NCI Genomic Data Commons.",
+			Long: `A command line for the NCI Genomic Data Commons (GDC).
 
-gdc reads public gdc data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+gdc reads cancer genomics data from the NCI GDC API, which indexes
+50k+ cases, 1.27M files, and 3.3M mutations across 91 cancer projects.
+No API key required.`,
+			Site: "https://portal.gdc.cancer.gov/",
 			Repo: "https://github.com/tamnd/gdc-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `gdc page` and
-	// `ant get gdc://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search cases by keyword (--site, --project, --limit, --offset)",
+		Args:    []kit.Arg{{Name: "keyword", Help: "search keyword"}}}, searchCases)
 
-	// List op: members of a page, the home of `gdc links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// gdc://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "case", Group: "read", Single: true,
+		Summary: "Get a single case by case_id", URIType: "case", Resolver: true,
+		Args: []kit.Arg{{Name: "case-id", Help: "GDC case_id or submitter_id"}}}, getCase)
+
+	kit.Handle(app, kit.OpMeta{Name: "files", Group: "read", List: true,
+		Summary: "List files for a case (--limit)",
+		Args:    []kit.Arg{{Name: "case-id", Help: "GDC case_id"}}}, listFiles)
+
+	kit.Handle(app, kit.OpMeta{Name: "mutations", Group: "read", List: true,
+		Summary: "List mutations in a gene (--limit)",
+		Args:    []kit.Arg{{Name: "gene", Help: "gene symbol (e.g. TP53, BRCA1)"}}}, searchMutations)
+
+	kit.Handle(app, kit.OpMeta{Name: "projects", Group: "read", List: true,
+		Summary: "List all GDC cancer projects (--limit)"}, listProjects)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the GDC client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +82,146 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Keyword string  `kit:"arg"          help:"search keyword"`
+	Site    string  `kit:"flag"         help:"filter by primary site"`
+	Project string  `kit:"flag"         help:"filter by project_id"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Offset  int     `kit:"flag"         help:"pagination offset"`
+	Client  *Client `kit:"inject"`
+}
+
+type caseInput struct {
+	CaseID string  `kit:"arg"    help:"GDC case_id"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type filesInput struct {
+	CaseID string  `kit:"arg"          help:"GDC case_id"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Offset int     `kit:"flag"         help:"pagination offset"`
+	Client *Client `kit:"inject"`
+}
+
+type mutationsInput struct {
+	Gene   string  `kit:"arg"          help:"gene symbol"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Offset int     `kit:"flag"         help:"pagination offset"`
+	Client *Client `kit:"inject"`
+}
+
+type projectsInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Offset int     `kit:"flag"         help:"pagination offset"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func searchCases(ctx context.Context, in searchInput, emit func(*Case) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	cases, _, err := in.Client.SearchCases(ctx, in.Keyword, in.Site, in.Project, limit, in.Offset)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range cases {
+		if err := emit(&cases[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full gdc.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized gdc reference: %q", input)
+func getCase(ctx context.Context, in caseInput, emit func(*Case) error) error {
+	c, err := in.Client.GetCase(ctx, in.CaseID)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	return emit(c)
+}
+
+func listFiles(ctx context.Context, in filesInput, emit func(*File) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	files, _, err := in.Client.ListFiles(ctx, in.CaseID, limit, in.Offset)
+	if err != nil {
+		return err
+	}
+	for i := range files {
+		if err := emit(&files[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func searchMutations(ctx context.Context, in mutationsInput, emit func(*Mutation) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	mutations, _, err := in.Client.SearchMutations(ctx, in.Gene, limit, in.Offset)
+	if err != nil {
+		return err
+	}
+	for i := range mutations {
+		if err := emit(&mutations[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listProjects(ctx context.Context, in projectsInput, emit func(*Project) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	projects, _, err := in.Client.ListProjects(ctx, limit, in.Offset)
+	if err != nil {
+		return err
+	}
+	for i := range projects {
+		if err := emit(&projects[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Classify turns any accepted input into the canonical (type, id).
+// UUID-shaped inputs (contain "-" and len>30) are treated as case IDs;
+// everything else is also classified as a case keyword search target.
+func (Domain) Classify(input string) (string, string, error) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", "", errs.Usage("gdc requires a case_id or keyword, got empty input")
+	}
+	return "case", s, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "case":
+		return fmt.Sprintf("https://portal.gdc.cancer.gov/cases/%s", id), nil
+	case "file":
+		return fmt.Sprintf("https://portal.gdc.cancer.gov/files/%s", id), nil
+	case "project":
+		return fmt.Sprintf("https://portal.gdc.cancer.gov/projects/%s", id), nil
+	default:
 		return "", errs.Usage("gdc has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
