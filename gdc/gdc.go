@@ -1,200 +1,477 @@
 // Package gdc is the library behind the gdc command line:
-// the HTTP client, request shaping, and the typed data models for gdc.
+// the HTTP client, request shaping, and the typed data models for the
+// NCI Genomic Data Commons (GDC), which indexes cancer genomics data:
+// 50k+ cases, 1.27M files, 3.3M mutations across 91 cancer projects.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package gdc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to gdc. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "gdc/dev (+https://github.com/tamnd/gdc-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at gdc.com; change it once you
-// know the real endpoints you want to read.
-const Host = "gdc.com"
+// Host is the GDC API hostname this client talks to.
+const Host = "api.gdc.cancer.gov"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://api.gdc.cancer.gov"
 
-// Client talks to gdc over HTTP.
-type Client struct {
-	HTTP      *http.Client
+const defaultUserAgent = "gdc-cli/0.1.0"
+
+// Config holds the runtime settings for the GDC client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+}
 
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: defaultUserAgent,
+	}
+}
+
+// Client talks to the GDC REST API.
+type Client struct {
+	cfg  Config
+	http *http.Client
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+// NewClient returns a Client using the given Config.
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
-			}
-		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
-}
-
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
+	if c.cfg.Rate > 0 {
+		if since := time.Since(c.last); since < c.cfg.Rate {
+			time.Sleep(c.cfg.Rate - since)
+		}
 	}
 	c.last = time.Now()
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
+func (c *Client) get(ctx context.Context, rawURL string, out any) error {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			d := time.Duration(attempt) * 500 * time.Millisecond
+			if d > 5*time.Second {
+				d = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+			}
+		}
+		c.pace()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(out)
 	}
-	return d
+	return fmt.Errorf("all retries exhausted")
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on gdc.com. It is a stand-in for the typed records you
-// will model from the real gdc endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `gdc cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (unexported) ---
+
+type wirePagination struct {
+	Total int `json:"total"`
+	Count int `json:"count"`
+	Page  int `json:"page"`
+	From  int `json:"from"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type wireDataResp struct {
+	Data struct {
+		Pagination wirePagination    `json:"pagination"`
+		Hits       []json.RawMessage `json:"hits"`
+	} `json:"data"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+type wireCase struct {
+	ID          string `json:"id"`
+	CaseID      string `json:"case_id"`
+	SubmitterID string `json:"submitter_id"`
+	PrimarySite string `json:"primary_site"`
+	DiseaseType string `json:"disease_type"`
+	Project     struct {
+		ProjectID string `json:"project_id"`
+		Name      string `json:"name"`
+	} `json:"project"`
+	Demographic struct {
+		AgeAtIndex int    `json:"age_at_index"`
+		Gender     string `json:"gender"`
+		Race       string `json:"race"`
+	} `json:"demographic"`
+}
+
+type wireFile struct {
+	FileID       string `json:"file_id"`
+	FileName     string `json:"file_name"`
+	DataType     string `json:"data_type"`
+	DataCategory string `json:"data_category"`
+	DataFormat   string `json:"data_format"`
+	FileSize     int64  `json:"file_size"`
+	Access       string `json:"access"`
+	Cases        []struct {
+		CaseID  string `json:"case_id"`
+		Project struct {
+			ProjectID string `json:"project_id"`
+		} `json:"project"`
+	} `json:"cases"`
+}
+
+type wireMutation struct {
+	SsmID           string `json:"ssm_id"`
+	Chromosome      string `json:"chromosome"`
+	StartPosition   int64  `json:"start_position"`
+	EndPosition     int64  `json:"end_position"`
+	ReferenceAllele string `json:"reference_allele"`
+	TumorAllele     string `json:"tumor_allele"`
+	MutationSubtype string `json:"mutation_subtype"`
+	Consequence     []struct {
+		Transcript struct {
+			Gene struct {
+				GeneID string `json:"gene_id"`
+				Symbol string `json:"symbol"`
+			} `json:"gene"`
+		} `json:"transcript"`
+	} `json:"consequence"`
+}
+
+type wireProject struct {
+	ProjectID          string `json:"project_id"`
+	Name               string `json:"name"`
+	PrimarySite        string `json:"primary_site"`
+	DBGapAccessionNum  string `json:"dbgap_accession_number"`
+	Program            struct {
+		Name string `json:"name"`
+	} `json:"program"`
+	Summary struct {
+		CaseCount int `json:"case_count"`
+		FileCount int `json:"file_count"`
+	} `json:"summary"`
+}
+
+// --- public types ---
+
+// Case is a single GDC cancer case record.
+type Case struct {
+	ID          string `json:"id"           kit:"id"`
+	SubmitterID string `json:"submitter_id"`
+	ProjectID   string `json:"project_id"`
+	PrimarySite string `json:"primary_site"`
+	DiseaseType string `json:"disease_type"`
+	Age         int    `json:"age"`
+	Gender      string `json:"gender"`
+	Race        string `json:"race"`
+}
+
+// File is a single GDC file record.
+type File struct {
+	ID           string `json:"id"            kit:"id"`
+	Name         string `json:"name"`
+	DataType     string `json:"data_type"`
+	DataCategory string `json:"data_category"`
+	Format       string `json:"format"`
+	SizeBytes    int64  `json:"size_bytes"`
+	Access       string `json:"access"`
+	CaseID       string `json:"case_id"`
+	ProjectID    string `json:"project_id"`
+}
+
+// Mutation is a single GDC somatic mutation (SSM) record.
+type Mutation struct {
+	ID           string `json:"id"            kit:"id"`
+	Chromosome   string `json:"chromosome"`
+	StartPos     int64  `json:"start_pos"`
+	EndPos       int64  `json:"end_pos"`
+	RefAllele    string `json:"ref_allele"`
+	TumorAllele  string `json:"tumor_allele"`
+	MutationType string `json:"mutation_type"`
+	GeneID       string `json:"gene_id"`
+	GeneSymbol   string `json:"gene_symbol"`
+}
+
+// Project is a single GDC cancer project record.
+type Project struct {
+	ID          string `json:"id"           kit:"id"`
+	Name        string `json:"name"`
+	Program     string `json:"program"`
+	PrimarySite string `json:"primary_site"`
+	Cases       int    `json:"cases"`
+	Files       int    `json:"files"`
+}
+
+// toCase maps a wireCase to a public Case.
+func toCase(w wireCase) *Case {
+	id := w.CaseID
+	if id == "" {
+		id = w.ID
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	return &Case{
+		ID:          id,
+		SubmitterID: w.SubmitterID,
+		ProjectID:   w.Project.ProjectID,
+		PrimarySite: w.PrimarySite,
+		DiseaseType: w.DiseaseType,
+		Age:         w.Demographic.AgeAtIndex,
+		Gender:      w.Demographic.Gender,
+		Race:        w.Demographic.Race,
+	}
+}
+
+// toFile maps a wireFile to a public File.
+func toFile(w wireFile) *File {
+	var caseID, projectID string
+	if len(w.Cases) > 0 {
+		caseID = w.Cases[0].CaseID
+		projectID = w.Cases[0].Project.ProjectID
+	}
+	return &File{
+		ID:           w.FileID,
+		Name:         w.FileName,
+		DataType:     w.DataType,
+		DataCategory: w.DataCategory,
+		Format:       w.DataFormat,
+		SizeBytes:    w.FileSize,
+		Access:       w.Access,
+		CaseID:       caseID,
+		ProjectID:    projectID,
+	}
+}
+
+// toMutation maps a wireMutation to a public Mutation.
+func toMutation(w wireMutation) *Mutation {
+	var geneID, geneSymbol string
+	if len(w.Consequence) > 0 {
+		geneID = w.Consequence[0].Transcript.Gene.GeneID
+		geneSymbol = w.Consequence[0].Transcript.Gene.Symbol
+	}
+	return &Mutation{
+		ID:           w.SsmID,
+		Chromosome:   w.Chromosome,
+		StartPos:     w.StartPosition,
+		EndPos:       w.EndPosition,
+		RefAllele:    w.ReferenceAllele,
+		TumorAllele:  w.TumorAllele,
+		MutationType: w.MutationSubtype,
+		GeneID:       geneID,
+		GeneSymbol:   geneSymbol,
+	}
+}
+
+// toProject maps a wireProject to a public Project.
+func toProject(w wireProject) *Project {
+	return &Project{
+		ID:          w.ProjectID,
+		Name:        w.Name,
+		Program:     w.Program.Name,
+		PrimarySite: w.PrimarySite,
+		Cases:       w.Summary.CaseCount,
+		Files:       w.Summary.FileCount,
+	}
+}
+
+// filterJSON builds a GDC filter JSON string for a single equality check.
+func filterJSON(field, value string) string {
+	b, _ := json.Marshal(map[string]any{
+		"op": "and",
+		"content": []map[string]any{
+			{
+				"op": "=",
+				"content": map[string]any{
+					"field": field,
+					"value": value,
+				},
+			},
+		},
+	})
+	return string(b)
+}
+
+// filterAnd builds a GDC filter JSON string for multiple equality checks.
+func filterAnd(pairs [][2]string) string {
+	content := make([]map[string]any, 0, len(pairs))
+	for _, p := range pairs {
+		content = append(content, map[string]any{
+			"op": "=",
+			"content": map[string]any{
+				"field": p[0],
+				"value": p[1],
+			},
+		})
+	}
+	b, _ := json.Marshal(map[string]any{
+		"op":      "and",
+		"content": content,
+	})
+	return string(b)
+}
+
+const caseFields = "case_id,submitter_id,project.project_id,project.name,primary_site,disease_type,demographic.age_at_index,demographic.gender,demographic.race"
+const fileFields = "file_id,file_name,data_type,data_category,data_format,file_size,access,state,cases.case_id,cases.project.project_id"
+const mutationFields = "ssm_id,chromosome,start_position,end_position,reference_allele,tumor_allele,mutation_subtype,consequence.transcript.gene.gene_id,consequence.transcript.gene.symbol"
+const projectFields = "project_id,name,program.name,primary_site,dbgap_accession_number,releasable,released,state,summary.case_count,summary.file_count"
+
+// SearchCases searches cases by keyword and optional site/project filters.
+func (c *Client) SearchCases(ctx context.Context, keyword, site, project string, limit, from int) ([]Case, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := fmt.Sprintf("%s/cases?size=%d&from=%d&format=json&fields=%s",
+		c.cfg.BaseURL, limit, from, url.QueryEscape(caseFields))
+	if keyword != "" {
+		u += "&q=" + url.QueryEscape(keyword)
+	}
+
+	var filters [][2]string
+	if site != "" {
+		filters = append(filters, [2]string{"primary_site", site})
+	}
+	if project != "" {
+		filters = append(filters, [2]string{"project.project_id", project})
+	}
+	if len(filters) > 0 {
+		u += "&filters=" + url.QueryEscape(filterAnd(filters))
+	}
+
+	var resp wireDataResp
+	if err := c.get(ctx, u, &resp); err != nil {
+		return nil, 0, err
+	}
+	cases := make([]Case, 0, len(resp.Data.Hits))
+	for _, raw := range resp.Data.Hits {
+		var w wireCase
+		if err := json.Unmarshal(raw, &w); err != nil {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+		cases = append(cases, *toCase(w))
 	}
-	return out, nil
+	return cases, resp.Data.Pagination.Total, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetCase fetches a single case by its case_id.
+func (c *Client) GetCase(ctx context.Context, caseID string) (*Case, error) {
+	u := fmt.Sprintf("%s/cases/%s?format=json&fields=%s",
+		c.cfg.BaseURL, url.PathEscape(caseID), url.QueryEscape(caseFields))
+	// GDC single-entity endpoint returns {"data": {...}}
+	var resp struct {
+		Data wireCase `json:"data"`
 	}
-	return out
+	// First try as a direct single-entity response.
+	body := bytes.Buffer{}
+	_ = body // we decode directly
+	if err := c.get(ctx, u, &resp); err != nil {
+		return nil, err
+	}
+	return toCase(resp.Data), nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ListFiles lists files for a given case_id.
+func (c *Client) ListFiles(ctx context.Context, caseID string, limit, from int) ([]File, int, error) {
+	if limit <= 0 {
+		limit = 20
 	}
-	return s
+	u := fmt.Sprintf("%s/files?size=%d&from=%d&format=json&fields=%s&filters=%s",
+		c.cfg.BaseURL, limit, from, url.QueryEscape(fileFields),
+		url.QueryEscape(filterJSON("cases.case_id", caseID)))
+	var resp wireDataResp
+	if err := c.get(ctx, u, &resp); err != nil {
+		return nil, 0, err
+	}
+	files := make([]File, 0, len(resp.Data.Hits))
+	for _, raw := range resp.Data.Hits {
+		var w wireFile
+		if err := json.Unmarshal(raw, &w); err != nil {
+			continue
+		}
+		files = append(files, *toFile(w))
+	}
+	return files, resp.Data.Pagination.Total, nil
+}
+
+// SearchMutations lists mutations for a gene symbol.
+func (c *Client) SearchMutations(ctx context.Context, geneSymbol string, limit, from int) ([]Mutation, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := fmt.Sprintf("%s/ssms?size=%d&from=%d&format=json&fields=%s&filters=%s",
+		c.cfg.BaseURL, limit, from, url.QueryEscape(mutationFields),
+		url.QueryEscape(filterJSON("consequence.transcript.gene.symbol", geneSymbol)))
+	var resp wireDataResp
+	if err := c.get(ctx, u, &resp); err != nil {
+		return nil, 0, err
+	}
+	mutations := make([]Mutation, 0, len(resp.Data.Hits))
+	for _, raw := range resp.Data.Hits {
+		var w wireMutation
+		if err := json.Unmarshal(raw, &w); err != nil {
+			continue
+		}
+		mutations = append(mutations, *toMutation(w))
+	}
+	return mutations, resp.Data.Pagination.Total, nil
+}
+
+// ListProjects lists all GDC cancer projects.
+func (c *Client) ListProjects(ctx context.Context, limit, from int) ([]Project, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := fmt.Sprintf("%s/projects?size=%d&from=%d&format=json&fields=%s",
+		c.cfg.BaseURL, limit, from, url.QueryEscape(projectFields))
+	var resp wireDataResp
+	if err := c.get(ctx, u, &resp); err != nil {
+		return nil, 0, err
+	}
+	projects := make([]Project, 0, len(resp.Data.Hits))
+	for _, raw := range resp.Data.Hits {
+		var w wireProject
+		if err := json.Unmarshal(raw, &w); err != nil {
+			continue
+		}
+		projects = append(projects, *toProject(w))
+	}
+	return projects, resp.Data.Pagination.Total, nil
 }
